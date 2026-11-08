@@ -1,0 +1,7 @@
+# Public release allowlist. Keep all other files private.
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/THIRD_PARTY_NOTICES.md
+!/洛克观测站-S5龙棋士反推.html
