@@ -473,6 +473,9 @@ input:not([type=checkbox]),select,textarea{min-width:0;max-width:100%;font-size:
 .dice-nature-note{grid-column:1/-1;margin:0;color:var(--green);font-size:11px;line-height:1.8;overflow-wrap:anywhere}
 .boost-result-body>.dice-nature-note{margin-top:12px}
 .results .boost-result-body .dice-nature-note+.inference-scope-note{margin-top:5px}
+/* 数字框仅接受输入，隐藏浏览器原生增减按钮。 */
+input[type="number"]{appearance:textfield;-moz-appearance:textfield}
+input[type="number"]::-webkit-inner-spin-button,input[type="number"]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
 
 .inference-scope-note{padding:10px 12px;margin:0 0 14px;border:1px solid #e5dfc5;border-radius:8px;background:#faf6e9;color:#7d704d;font-size:11px;line-height:1.8;overflow-wrap:anywhere}.inference-scope-note b{font-weight:600}.inference-scope-note span{display:block;margin-top:3px}.boost-result-body>.inference-scope-note{font-size:10px;margin-bottom:12px}.edit-form>.inference-scope-note{margin-bottom:0}.site-scope-note{max-width:1208px;margin:0 auto;padding:0 0 18px;color:#85816c;font-size:10px;line-height:1.8;overflow-wrap:anywhere}
 @media(max-width:1280px){.site-scope-note{margin:0 36px}}@media(max-width:760px){.site-scope-note{margin:0 14px}.inference-scope-note{font-size:10px;padding:9px 10px;margin-bottom:11px}}
@@ -687,6 +690,73 @@ function recoveryHpRanges(o){
     return {percent,min:Math.max(r,1,Math.min(...ranges.map(x=>x[0]))),max:Math.max(...ranges.map(x=>x[1])),estimate:r/p};
   }).filter(x=>x.min<=x.max);
 }
+const HP_EXCHANGE_RULES_VERSION='hp-exchange-20261109-half-percent-v2';
+const BODY_HP_COMPARISON_MODEL='body-h0-offset21-22-candidate-v1';
+function validHpExchange(o){
+  const readingsValid=Number.isInteger(o.damage)&&o.damage>0&&
+    ['beforePercent','afterPercent'].every(k=>Number.isFinite(o[k])&&o[k]>=0&&o[k]<=100)&&o.afterPercent-o.beforePercent>=.01-1e-10;
+  if(o.exchangeRulesVersion===HP_EXCHANGE_RULES_VERSION)return readingsValid&&o.percentTolerance===.5;
+  return readingsValid&&
+    ['minePercent','beforePercent','afterPercent'].every(k=>Number.isFinite(o[k])&&o[k]>=0&&o[k]<=100)&&
+    o.afterPercent-o.beforePercent>=.01-1e-10&&o.afterPercent===o.minePercent&&
+    ['exact','display','floor','round','ceil'].includes(o.percentMode)&&['unknown','floor','round','ceil'].includes(o.rounding)&&
+    (o.percentMode==='exact'||['minePercent','beforePercent','afterPercent'].every(k=>Number.isInteger(o[k])));
+}
+// 新记录固定使用闭区间 ±0.5 个百分点；100%仅代表实际满血。
+function exchangePercentBand(shown){return shown===100?[100,100]:[Math.max(0,shown-.5),Math.min(100,shown+.5)];}
+function exchangeIntegerHpRange(maxHp,shown){
+  const [low,high]=exchangePercentBand(shown);
+  const min=Math.ceil(snapInteger(low*maxHp/100)),max=Math.floor(snapInteger(high*maxHp/100));
+  return min<=max?[min,max]:null;
+}
+// 整数百分比是显示区间。回血为结算后的实际增量，回到100%可以直接使用。
+function hpExchangeMatches(maxHp,o){
+  if(!Number.isInteger(maxHp)||maxHp<o.damage||!validHpExchange(o))return false;
+  if(o.exchangeRulesVersion===HP_EXCHANGE_RULES_VERSION){
+    const before=exchangeIntegerHpRange(maxHp,o.beforePercent),after=exchangeIntegerHpRange(maxHp,o.afterPercent);
+    return !!before&&!!after&&Math.max(before[0],after[0]-o.damage)<=Math.min(before[1],after[1]-o.damage);
+  }
+  if(o.percentMode==='exact')return recoveryHpRanges({damage:o.damage,healPercents:[o.afterPercent-o.beforePercent],rounding:o.rounding}).some(r=>maxHp>=r.min&&maxHp<=r.max);
+  const modes=o.percentMode==='display'?['floor','round','ceil']:[o.percentMode];
+  return modes.some(mode=>{
+    const before=percentHpRange(maxHp,o.beforePercent,1,mode),after=o.afterPercent===100?[maxHp,maxHp]:percentHpRange(maxHp,o.afterPercent,1,mode);
+    return !!before&&!!after&&Math.max(before[0],after[0]-o.damage)<=Math.min(before[1],after[1]-o.damage);
+  });
+}
+// 界面区间给出保守上下界；候选筛选仍逐个核对整数血量，避免边界或区间空洞误判。
+function hpExchangeRanges(o){
+  if(!validHpExchange(o))return [];
+  const percent=o.afterPercent-o.beforePercent,estimate=o.damage*100/percent;
+  if(o.exchangeRulesVersion===HP_EXCHANGE_RULES_VERSION){
+    const before=exchangePercentBand(o.beforePercent),after=exchangePercentBand(o.afterPercent);
+    const upper=after[1]-before[0],lower=after[0]-before[1];
+    let min=Math.max(o.damage,Math.ceil(snapInteger(o.damage*100/upper))),max=lower>0?Math.floor(snapInteger(o.damage*100/lower)):null;
+    while((max===null||min<=max)&&!hpExchangeMatches(min,o))min++;
+    while(max!==null&&max>=min&&!hpExchangeMatches(max,o))max--;
+    return max!==null&&max<min?[]:[{percent,min,max,estimate}];
+  }
+  if(o.percentMode==='exact')return recoveryHpRanges({damage:o.damage,healPercents:[percent],rounding:o.rounding});
+  const modes=o.percentMode==='display'?['floor','round','ceil']:[o.percentMode];
+  const ranges=modes.flatMap(mode=>{
+    const band=p=>p===100?[100,100]:[Math.max(0,p-(mode==='round'?.5:mode==='ceil'?1:0)),Math.min(100,p+(mode==='round'?.5:mode==='floor'?1:0))];
+    const before=band(o.beforePercent),after=band(o.afterPercent),upper=after[1]-before[0],lower=after[0]-before[1];
+    let min=Math.max(o.damage,Math.ceil(snapInteger(o.damage*100/upper))),max=lower>0?Math.floor(snapInteger(o.damage*100/lower)):null;
+    while((max===null||min<=max)&&!hpExchangeMatches(min,{...o,percentMode:mode}))min++;
+    while(max!==null&&max>=min&&!hpExchangeMatches(max,{...o,percentMode:mode}))max--;
+    return max!==null&&max<min?[]:[{percent,min,max,estimate}];
+  });
+  if(!ranges.length)return [];
+  return [{percent,min:Math.min(...ranges.map(r=>r.min)),max:ranges.some(r=>r.max===null)?null:Math.max(...ranges.map(r=>r.max)),estimate}];
+}
+// 四条旧样本不能区分偏移21/22；外观、骰面和额外特性倍率只在参考值上计一次。
+function bodyHpCandidates(reference,o){
+  if(!['normal','shiny'].includes(o.appearance)||!(o.diceHpMultiplier>0&&o.traitHpMultiplier>0))return [];
+  const multiplier=(o.appearance==='shiny'?1.5:1)*o.diceHpMultiplier*o.traitHpMultiplier;
+  return [...new Set(([21,22].includes(o.bodyHpOffset)?[o.bodyHpOffset]:[21,22]).flatMap(offset=>{
+    const raw=snapInteger((reference+offset)*multiplier);
+    return ['floor','round','ceil'].includes(o.bodyHpRounding)?[Math[o.bodyHpRounding](raw)]:[Math.floor(raw),Math.round(raw),Math.ceil(raw)];
+  }))].filter(hp=>hp>0);
+}
 const statusHpBasis=(hp,o)=>snapInteger((hp*(o.hpScale??1)+(o.hpOffset??0))*o.hpMultiplier*(o.diceHpMultiplier??1));
 // 冻结20层是独立的力竭候选，不套每层百分比、属性相克或逐层取整。
 function freezeHpValues(hp,o){
@@ -750,6 +820,7 @@ function hpObservationMatches(hp,o,defense){
 }
 function consistent(value,observation,stat){
   const o=observation;
+  if(o.kind==='hp-exchange')return bodyHpCandidates(value,o).some(hp=>hpExchangeMatches(hp,o));
   if(o.kind==='percentage'&&o.effect==='freeze'&&o.statusModel==='freeze-remaining-percent')return freezeDamageRanges(value,o).some(([lo,hi])=>o.max>=lo&&o.min<=hi);
   // 未确认冻结飘字口径时，只把它作为最大生命下限，不能伪造精确生命。
   if(o.kind==='percentage'&&o.effect==='freeze'&&o.freezeBasis==='unknown'&&o.amountMode!=='percent')return o.min>0&&o.min<=o.max&&freezeHpValues(value,o).some(hp=>hp>=o.min);
@@ -777,8 +848,8 @@ function combinations(domains,up,model){
 }
 function solve({pet,natures,expression='unknown',model='unknown',observations=[],overrides={},level,stars=5,appearance='unknown'}){
   // 本体回复仅计算战斗生命范围，尚不用于性格或天分筛选。
-  observations=observations.filter(o=>o.kind!=='recovery');
-  if(appearance==='unknown'&&observations.some(o=>o.included!==false&&['incoming','percentage'].includes(o.kind)&&o.combatModel===COMBAT_MODEL_VERSION&&(!o.appearance||o.appearance==='unknown'))){
+  observations=observations.filter(o=>o.kind!=='recovery'&&(o.kind!=='hp-exchange'||o.hpComparisonModel===BODY_HP_COMPARISON_MODEL));
+  if(appearance==='unknown'&&observations.some(o=>o.included!==false&&['incoming','percentage','hp-exchange'].includes(o.kind)&&o.combatModel===COMBAT_MODEL_VERSION&&(!o.appearance||o.appearance==='unknown'))){
     // 外观未知时，整组记录共用同一个外观假设，不逐条挑选倍率。
     const scenarios=['normal','shiny'].map(appearance=>({appearance,result:solve({pet,natures,expression,model,observations,overrides,level,stars,appearance})}));
     const merged=new Map();
@@ -813,9 +884,15 @@ function solve({pet,natures,expression='unknown',model='unknown',observations=[]
   for(const nature of natureSet(natures,expression)){
     let domains=Object.fromEntries(STATS.map(k=>[k,model==='zero'?[0]:Array.from({length:11},(_,i)=>i)]));
     const growth=level===undefined?undefined:{level,stars};
+    const exchanges=observations.filter(o=>o.kind==='hp-exchange');
+    // 同一目标的各次交换共用一个本体偏移假设，不能逐笔挑21或22拼出性格解。
+    if(exchanges.length&&![21,22].some(bodyHpOffset=>['floor','round','ceil'].some(bodyHpRounding=>exchanges.every(o=>{
+      const reference=panelStat(Number(overrides.hp??pet.stats.hp),0,nature,'hp','source',{level:o.level??level,stars:0});
+      return consistent(reference,{...o,bodyHpOffset,bodyHpRounding,appearance:o.appearance&&o.appearance!=='unknown'?o.appearance:appearance},'hp');
+    }))))continue;
     const statValues=(k,i)=>[...new Set(['source','current','legacy'].map(m=>panelStat(Number(overrides[k]??pet.stats[k]),i,nature,k,m,growth)))];
     const matchingValues=(k,i)=>statValues(k,i).filter(value=>observations.filter(o=>o.stat===k&&!['percentage','outgoing-percent'].includes(o.kind)).every(o=>{
-      if(o.kind==='incoming'&&o.combatModel===COMBAT_MODEL_VERSION){
+      if(['incoming','hp-exchange'].includes(o.kind)&&o.combatModel===COMBAT_MODEL_VERSION){
         const reference=panelStat(Number(overrides[k]??pet.stats[k]),0,nature,k,'source',{level:o.level??level,stars:0});
         return consistent(reference,{...o,appearance:o.appearance&&o.appearance!=='unknown'?o.appearance:appearance},k);
       }
@@ -881,7 +958,7 @@ function nextTest(result){
 }
 
 // 测算记录保留原始观测与当时结果；导入不会把旧模型结果当成新模型证据。
-const RESEARCH_RECORD_VERSION=9;
+const RESEARCH_RECORD_VERSION=11;
 const APPEARANCE_NAMES={unknown:'未确认',normal:'非异色',shiny:'异色'};
 const INFERENCE_SCOPE_NOTICE='物防、速度仅在表情指示时判定；暂不支持物防、魔防和速度的战斗反推，后续可能上线，暂无确定时间。';
 const INFERENCE_SCOPE_DETAIL='战斗记录仅辅助判断生命、物攻、魔攻的性格提升项。物防、速度仅在开心、困倦、怯懦或暴怒的对应表情指示时显示，并注明“表情得出”；开心只能确定物防或速度二选一。平和、未看清时隐藏这两项，不用战斗记录消除其表情歧义。相关双防、速度战斗公式尚未完成校准，不能据此推断数值或天分；六维资料、已知面板、捕后数据与旧版快照仅供记录或对照。';
@@ -905,9 +982,17 @@ function validResearchRecord(r){
   if(r.capture){
     if(!text(r.capture.nature,30)||!boundedStats(r.capture.ivs,10)||!boundedStats(r.capture.panel,99999))return false;
   }
-  if(!r.observations.every(o=>o&&['incoming','percentage','recovery','stat','speed','outgoing','outgoing-percent','note'].includes(o.kind)&&(!o.stat||['hp','atk','spa','def','spd','spe'].includes(o.stat))&&['min','max','damage','power','defense','attack','level','multiplier','basePower','layers','percent','correction','hpScale','hpOffset','hpMultiplier','diceHpMultiplier'].every(k=>o[k]===undefined||o[k]===null||finite(o[k]))&&(!o.label||text(o.label,1000))&&(!o.dice||diceValid(o.dice))&&(!o.powerFactors||['base','flat','percent','stab','baseType','type','awakening','rank','power','final'].every(k=>o.powerFactors[k]===undefined||finite(o.powerFactors[k],-10000,1e9)))))return false;
+  if(!r.observations.every(o=>o&&['incoming','percentage','recovery','hp-exchange','stat','speed','outgoing','outgoing-percent','note'].includes(o.kind)&&(!o.stat||['hp','atk','spa','def','spd','spe'].includes(o.stat))&&['min','max','damage','power','defense','attack','level','multiplier','basePower','layers','percent','correction','hpScale','hpOffset','hpMultiplier','diceHpMultiplier'].every(k=>o[k]===undefined||o[k]===null||finite(o[k]))&&(!o.label||text(o.label,1000))&&(!o.dice||diceValid(o.dice))&&(!o.powerFactors||['base','flat','percent','stab','baseType','type','awakening','rank','power','final'].every(k=>o.powerFactors[k]===undefined||finite(o.powerFactors[k],-10000,1e9)))))return false;
   if(!r.observations.every(o=>(o.statusModel===undefined||['percent-maxhp','percent-maxhp-candidate','freeze-20-collapse','freeze-remaining-percent'].includes(o.statusModel))&&(o.freezeBasis===undefined||['unknown','maximum','remaining'].includes(o.freezeBasis))&&(o.priorHpLoss===undefined||Number.isInteger(o.priorHpLoss)&&finite(o.priorHpLoss))&&(o.freezeBasis!=='remaining'||Number.isInteger(o.priorHpLoss))&&(!['freeze-20-collapse','freeze-remaining-percent'].includes(o.statusModel)||o.effect==='freeze'&&o.layers===20)&&(o.remainingPercent===undefined||Number.isInteger(o.remainingPercent)&&finite(o.remainingPercent,0,100))&&(o.statusModel!=='freeze-remaining-percent'||Number.isInteger(o.remainingPercent))&&(o.remainingDisplayRounding===undefined||o.remainingDisplayRounding==='floor')))return false;
   if(!r.observations.every(o=>o.kind!=='recovery'||o.stat==='hp'&&o.phase==='body'&&Number.isInteger(o.damage)&&o.damage>0&&o.min===o.damage&&o.max===o.damage&&o.recoveryComplete===true&&o.recoveryRulesVersion==='body-recovery-20261108-v1'&&Array.isArray(o.healPercents)&&o.healPercents.length>0&&o.healPercents.length<=2&&o.healPercents.every(p=>finite(p,.01,100))&&['unknown','floor','round','ceil'].includes(o.rounding)))return false;
+  if(!r.observations.every(o=>o.kind!=='hp-exchange'||r.version>=10&&o.stat==='hp'&&o.phase==='body'&&Number.isInteger(o.damage)&&o.damage>0&&o.min===o.damage&&o.max===o.damage&&o.conditionsConfirmed===true&&
+    o.combatModel==='wild-attack-20261108-v1'&&
+    ['beforePercent','afterPercent'].every(k=>finite(o[k],0,100))&&o.afterPercent-o.beforePercent>=.01-1e-10&&
+    (o.exchangeRulesVersion==='hp-exchange-20261109-half-percent-v2'?r.version>=11&&o.percentTolerance===.5:
+     o.exchangeRulesVersion==='hp-exchange-20261109-v1'&&finite(o.minePercent,0,100)&&o.afterPercent===o.minePercent&&
+     ['exact','display','floor','round','ceil'].includes(o.percentMode)&&(o.percentMode==='exact'||['minePercent','beforePercent','afterPercent'].every(k=>Number.isInteger(o[k])))&&
+     ['unknown','floor','round','ceil'].includes(o.rounding))&&finite(o.diceHpMultiplier,.001,100)&&finite(o.traitHpMultiplier,.001,100)&&
+    Object.hasOwn(APPEARANCE_NAMES,o.appearance)&&['range-only','body-h0-offset21-22-candidate-v1'].includes(o.hpComparisonModel)))return false;
   const count=x=>Number.isInteger(x)&&finite(x,0,999);
   if(!r.observations.every(o=>(o.baseMultiplier===undefined||finite(o.baseMultiplier))&&
     (o.response===undefined||o.response&&typeof o.response.enabled==='boolean'&&['powerMultiplier','powerFlat','powerPercent','damageMultiplier'].every(k=>finite(o.response[k]))&&count(o.response.count)&&count(o.response.poisonLayers))&&
@@ -933,7 +1018,7 @@ function mergeResearchRecords(existing,incoming){
 }
 function researchCSV(records){
   const stats=['hp','atk','spa','def','spd','spe'];
-  const conditionHeaders=['冻结剩余血量百分比','剩余百分比显示取整','是否被应对','应对效果快照','累计应对次数','应对中毒层数','应对威力倍数','应对固定威力','应对威力百分比','应对伤害倍数','未计应对最终倍率','我方是否开盾','盾技能ID','盾技能名称','盾技能快照','盾减伤百分比','盾技能位置','盾中毒层数','无盾伤害整数区间','回复比例候选 %','完整未截断回复','回复规则版本'];
+  const conditionHeaders=['冻结剩余血量百分比','剩余百分比显示取整','是否被应对','应对效果快照','累计应对次数','应对中毒层数','应对威力倍数','应对固定威力','应对威力百分比','应对伤害倍数','未计应对最终倍率','我方是否开盾','盾技能ID','盾技能名称','盾技能快照','盾减伤百分比','盾技能位置','盾中毒层数','无盾伤害整数区间','回复比例候选 %','完整未截断回复','回复规则版本','交换前我方血量 %','交换前对方血量 %','交换后对方血量 %','交换百分比口径','额外特性生命倍率','交换规则版本','本体生命对照模型','交换百分比容差（百分点）'];
   const headers=['记录ID','记录名称','保存时间','模型版本','目标','等级','目标外观','细分组','表情','阶段','对战组','我方精灵','我方等级','我方星级','我方外观','我方性格',...stats.map(k=>'我方面板_'+k),...stats.map(k=>'我方天分_'+k),'我方骰面','对方骰面','观测类型','攻击通道','技能','技能ID','基础威力','固定加威力','威力百分比','本系倍率','基础相克','应用相克','觉醒修正','攻防修正','未取整计算威力','最终倍率','我方对应防御','实际飘字','状态','层数','每层百分比','状态规则版本','状态结算模型','冻结飘字口径','此前累计净扣血','生命换算','外观生命倍率','骰面生命倍率','扣血取整','条件已核对','参与计算','存档原因','当时物攻判断','当时魔攻判断','当时生命判断','联合判别版本','联合记录冲突','当时候选性格','捕后性格',...stats.map(k=>'捕后天分_'+k),...stats.map(k=>'捕后面板_'+k),'备注'];
   // 文本以公式符号开头时按文本导出，避免被表格软件执行。
   const cell=value=>{
@@ -945,7 +1030,7 @@ function researchCSV(records){
   const lines=[[...headers,...conditionHeaders,'当前支持的反推范围','暂不支持的反推范围','反推范围说明','当时物防判断（仅表情）','物防判断来源','当时速度判断（仅表情）','速度判断来源','当时物攻可能搭配','当时魔攻可能搭配','当时生命可能搭配']];
   for(const r of records)for(const o of r.observations.length?r.observations:[{}]){
     const p=o.profile||r.groups?.find(g=>g.id===o.groupId)?.profile||{},f=o.powerFactors||{},checks=r.boostEstimate?.checks||r.checks||[];
-    lines.push([r.id,r.title,r.updatedAt||r.date,r.modelVersion||'旧模型',r.targetName,o.targetLevel??o.level??r.targetLevel,APPEARANCE_NAMES[o.targetAppearance||o.appearance||r.targetAppearance]||'未确认',r.subgroup||'unknown',r.expression,o.phase,r.groups?.find(g=>g.id===o.groupId)?.name,p.nickname,p.level,p.stars,APPEARANCE_NAMES[p.appearance]||'未确认',p.nature,...stats.map(k=>o.profilePanel?.[k]??p.actual?.[k]),...stats.map(k=>p.ivs?.[k]),o.dice?.mine||r.dice?.mine,o.dice?.enemy||r.dice?.enemy,o.kind,o.stat,o.skillName||o.skill,o.skill,o.basePower,f.flat,f.percent,f.stab,f.baseType,f.type,f.awakening,f.rank,o.power,o.multiplier,o.defense,o.damage??(o.min===o.max?o.min:''),o.effect,o.layers,o.percent,o.statusRulesVersion,o.statusModel,o.freezeBasis,o.priorHpLoss,o.hpModel,o.hpMultiplier,o.diceHpMultiplier,o.rounding,o.conditionsConfirmed===true?'是':'未记录',o.included===false?'否':'是',o.disabledReason,...['atk','spa','hp'].map(k=>checks.find(c=>c.stat===k)?.answer),r.inferenceVersion,r.boostEstimate?.jointConflict,r.resultSnapshot?.natures?.join('、'),r.capture?.nature,...stats.map(k=>r.capture?.ivs?.[k]),...stats.map(k=>r.capture?.panel?.[k]),r.notes,o.remainingPercent,o.remainingDisplayRounding,o.response?.enabled,o.response?.rule,o.response?.count,o.response?.poisonLayers,o.response?.powerMultiplier,o.response?.powerFlat,o.response?.powerPercent,o.response?.damageMultiplier,o.baseMultiplier,o.shield?.enabled,o.shield?.skillId,o.shield?.skillName,o.shield?.skillSnapshot,o.shield?.reduction,o.shield?.slot,o.shield?.poisonLayers,o.unshieldedDamageRange,o.healPercents,o.recoveryComplete,o.recoveryRulesVersion,...scope,...['def','spe'].flatMap(stat=>{const c=checks.find(c=>c.stat===stat&&c.expressionOnly===true&&c.source==='expression');return c?[c.answer,'表情得出']:['',''];}),...['atk','spa','hp'].map(stat=>checks.find(c=>c.stat===stat)?.compatibleScenarios||'')]);
+    lines.push([r.id,r.title,r.updatedAt||r.date,r.modelVersion||'旧模型',r.targetName,o.targetLevel??o.level??r.targetLevel,APPEARANCE_NAMES[o.targetAppearance||o.appearance||r.targetAppearance]||'未确认',r.subgroup||'unknown',r.expression,o.phase,r.groups?.find(g=>g.id===o.groupId)?.name,p.nickname,p.level,p.stars,APPEARANCE_NAMES[p.appearance]||'未确认',p.nature,...stats.map(k=>o.profilePanel?.[k]??p.actual?.[k]),...stats.map(k=>p.ivs?.[k]),o.dice?.mine||r.dice?.mine,o.dice?.enemy||r.dice?.enemy,o.kind,o.stat,o.skillName||o.skill,o.skill,o.basePower,f.flat,f.percent,f.stab,f.baseType,f.type,f.awakening,f.rank,o.power,o.multiplier,o.defense,o.damage??(o.min===o.max?o.min:''),o.effect,o.layers,o.percent,o.statusRulesVersion,o.statusModel,o.freezeBasis,o.priorHpLoss,o.hpModel,o.hpMultiplier,o.diceHpMultiplier,o.rounding,o.conditionsConfirmed===true?'是':'未记录',o.included===false?'否':'是',o.disabledReason,...['atk','spa','hp'].map(k=>checks.find(c=>c.stat===k)?.answer),r.inferenceVersion,r.boostEstimate?.jointConflict,r.resultSnapshot?.natures?.join('、'),r.capture?.nature,...stats.map(k=>r.capture?.ivs?.[k]),...stats.map(k=>r.capture?.panel?.[k]),r.notes,o.remainingPercent,o.remainingDisplayRounding,o.response?.enabled,o.response?.rule,o.response?.count,o.response?.poisonLayers,o.response?.powerMultiplier,o.response?.powerFlat,o.response?.powerPercent,o.response?.damageMultiplier,o.baseMultiplier,o.shield?.enabled,o.shield?.skillId,o.shield?.skillName,o.shield?.skillSnapshot,o.shield?.reduction,o.shield?.slot,o.shield?.poisonLayers,o.unshieldedDamageRange,o.healPercents,o.recoveryComplete,o.recoveryRulesVersion,o.minePercent,o.beforePercent,o.afterPercent,o.percentMode,o.traitHpMultiplier,o.exchangeRulesVersion,o.hpComparisonModel,o.percentTolerance,...scope,...['def','spe'].flatMap(stat=>{const c=checks.find(c=>c.stat===stat&&c.expressionOnly===true&&c.source==='expression');return c?[c.answer,'表情得出']:['',''];}),...['atk','spa','hp'].map(stat=>checks.find(c=>c.stat===stat)?.compatibleScenarios||'')]);
   }
   return '\uFEFF'+lines.map(row=>row.map(cell).join(',')).join('\r\n');
 }
@@ -979,7 +1064,7 @@ function renderUserGuide(data){
  <div class="guide-layout"><aside class="guide-index" aria-label="使用说明目录">${chapters.map(([id,title],i)=>`<button type="button" data-action="guide-section" data-id="${id}"><small>0${i+1}</small>${title}</button>`).join('')}</aside><div class="guide-content">
  <section class="guide-section" id="guide-start" tabindex="-1"><h2><span>01</span>快速上手</h2><div class="guide-note"><b>仅看表情：</b>选择开心、困倦、怯懦或暴怒，点击「查看表情判定」即可。无需等级、外观、我方精灵、技能、骰面或伤害；结果、保存及导出均注明表情来源。以下步骤用于继续战斗反推。</div><ol class="guide-steps"><li><b>建立我方档案。</b>到「我的精灵池」添加常用精灵，填写星级、实际物防和魔防即可；我方等级与其他面板可留空。</li><li><b>配置目标。</b>在「龙棋士反推」选择目标、游戏中显示的等级、外观和表情。没看清表情就选「未看清」。</li><li><b>核对战斗条件。</b>区分「龙棋士护盾」与「本体」阶段，双方分别选择本次实际掷中的骰面。</li><li><b>录入一次观测。</b>被攻击时选对方实际使用的技能，填完整整数飘字；状态扣血则填效果、结算层数和扣血飘字。</li><li><b>添加后再计算。</b>确认增减益，点「添加记录」，再点「判断加成」。连击只需录入一段（一层）伤害；相同条件、相同飘字无需重复添加。</li><li><b>继续核对并备份。</b>补充不同通道的观测，保存测算名称和备注；捕捉后可补录真实面板作对照。</li></ol></section>
  <section class="guide-section" id="guide-setup" tabindex="-1"><h2><span>02</span>目标与精灵档案</h2><h3>对方目标</h3><p>目标列表优先显示最低形态，按工具当前规则固定为0星。等级需要手动填写；新目标或重置后重新核对。外观未知时保留可选假设，不要为了得到唯一结果而猜选。</p><h3>我方档案</h3><p>这里的物防、魔防、速度来自已知面板或参考正算，用于录入和对照，不是目标属性反推结果。</p><p>选择我方精灵后，填写真实星级、实际物防和魔防即可。等级、生命、双攻与速度均为选填；我方等级不参与当前受击计算，对方目标等级仍需填写。性格、天分和外观无需填写；实际面板直接用于计算。表单会提示超出该精灵参考范围的数值；等级未填时按1–60级粗查，填入等级可进一步缩小范围。参考检查仅作提醒，不改写实际数据。</p><div class="guide-note"><b>同一目标换我方精灵：</b>用「换精灵 / 加组」继续记录。<br><b>遇到另一只目标：</b>用「新目标 / 重置」，避免混合两只目标的观测。</div></section>
- <section class="guide-section" id="guide-observe" tabindex="-1"><h2><span>03</span>怎样记录战斗</h2><div class="guide-table-wrap"><table class="guide-table"><thead><tr><th>记录内容</th><th>判断通道</th><th>填写重点</th></tr></thead><tbody><tr><td>对方物理技能打我方</td><td>对方物攻</td><td>对方技能、我方物防、受伤飘字</td></tr><tr><td>对方魔法技能打我方</td><td>对方魔攻</td><td>对方技能、我方魔防、受伤飘字</td></tr><tr><td>对方受到状态扣血</td><td>对方生命</td><td>状态、层数、扣血飘字与战斗阶段</td></tr></tbody></table></div><p>受击记录按技能类型自动读取我方档案中的物防或魔防；如需更正数值，请点「编辑档案」。我方双防是受击试算的已知输入，不是在反推对方双防；当前不通过我方攻击伤害或行动先后反推目标双防、速度。</p><h3>受击记录</h3><p>选择「它打我方」，技能应是对方打你的那一招。连击攻击仅需输入一段（一层）的完整整数飘字，不填连击总和；相同条件、相同数值只录一段。各段威力、增减益或伤害不同时分别记录对应条件。额外连击数可写备注，不乘入单段伤害或最终倍率。飘字包含溢出伤害，勿截成剩余生命。技能池以外的技能可在「技能总表」查找。</p><p>有本次应对增伤时选择实际条件，按提示补累计次数或中毒层数。我方开盾时选实际盾技能，按提示补位置或层数；保留原始受伤飘字，不自行除以减伤比例。100%免伤的零伤害只能存档。</p><p>「计算修正」中按效果原文区分基础威力、攻防变化和独立伤害倍率，勿把已换算的战斗显示威力再次当作基础威力。攻击+50%与魔攻+100%同类合并时是+150%，不能再填独立最终1.5倍；增加连击次数也不填最终倍率。已经自动处理的应对与盾减伤不要重复计入。</p><h3>状态与生命</h3><p>选择「状态扣血 / 生命」，填写本次实际结算的状态、层数和扣血。生命倍率读取目标外观，骰面生命倍率另外处理。冻结固定20层；填写结算前剩余血量，默认100%满血，显示80%会按80%至不足81%的区间筛选。</p><h3>破盾后回血</h3><p>破盾后对方不会攻击，只会使用状态技能、盾和聚能；此阶段只能通过百分比回血与完整回血飘字测算本体生命，因此仅提供「回血 / 生命」。选择回血技能并核对通常或应对分支，填写实际最大生命回复比例与完整回血飘字；未知应对保留两个范围。确认没有回满截断且核对回复增减益后添加，无需我方档案。计算结果为当时本体生命，不重复乘外观或骰面倍率。与捕后生命、性格和天分的换算尚未校准，当前仅测生命范围，不据此判断生命性格加成。第二条更新为42级伊雷龙应激反应回血48后已重新纳入，并加入幽铃回合末10%回血20；H₀+22按向下取整复现四条样本的43、48、38、20，暂保留为候选；+21同样匹配四条，尚未唯一确认常数22，生命提升性格及异色等情况仍待实测。</p><h3>骰面与修改</h3><div class="guide-note"><b>龙龙骰效果来源不一定可靠，请核对游戏内实际数据后再测算。</b></div><p>双方各选实际掷中的效果，四个备选骰面不会同时叠加。「未记录」暂按零加成试算，不代表实际没有加成。更改骰面后，受影响的旧观测可能转为存档。每条观测可点「修改」，保存后重新判断。</p></section>
+ <section class="guide-section" id="guide-observe" tabindex="-1"><h2><span>03</span>怎样记录战斗</h2><div class="guide-table-wrap"><table class="guide-table"><thead><tr><th>记录内容</th><th>判断通道</th><th>填写重点</th></tr></thead><tbody><tr><td>对方物理技能打我方</td><td>对方物攻</td><td>对方技能、我方物防、受伤飘字</td></tr><tr><td>对方魔法技能打我方</td><td>对方魔攻</td><td>对方技能、我方魔防、受伤飘字</td></tr><tr><td>对方受到状态扣血</td><td>对方生命</td><td>状态、层数、扣血飘字与战斗阶段</td></tr><tr><td>破盾后恶念交换</td><td>对方本体生命</td><td>对方交换前后百分比、对方回血飘字</td></tr></tbody></table></div><p>受击记录按技能类型自动读取我方档案中的物防或魔防；如需更正数值，请点「编辑档案」。我方双防是受击试算的已知输入，不是在反推对方双防；当前不通过我方攻击伤害或行动先后反推目标双防、速度。</p><h3>受击记录</h3><p>选择「它打我方」，技能应是对方打你的那一招。连击攻击仅需输入一段（一层）的完整整数飘字，不填连击总和；相同条件、相同数值只录一段。各段威力、增减益或伤害不同时分别记录对应条件。额外连击数可写备注，不乘入单段伤害或最终倍率。飘字包含溢出伤害，勿截成剩余生命。技能池以外的技能可在「技能总表」查找。</p><p>有本次应对增伤时选择实际条件，按提示补累计次数或中毒层数。我方开盾时选实际盾技能，按提示补位置或层数；保留原始受伤飘字，不自行除以减伤比例。100%免伤的零伤害只能存档。</p><p>「计算修正」中按效果原文区分基础威力、攻防变化和独立伤害倍率，勿把已换算的战斗显示威力再次当作基础威力。攻击+50%与魔攻+100%同类合并时是+150%，不能再填独立最终1.5倍；增加连击次数也不填最终倍率。已经自动处理的应对与盾减伤不要重复计入。</p><h3>状态与生命</h3><p>选择「状态扣血 / 生命」，填写本次实际结算的状态、层数和扣血。生命倍率读取目标外观，骰面生命倍率另外处理。冻结固定20层；填写结算前剩余血量，默认100%满血，显示80%会按80%至不足81%的区间筛选。</p><h3>破盾后回血</h3><p>破盾后对方不会攻击，只会使用状态技能、盾和聚能；此阶段可记录「回血 / 生命」或「恶念交换 / 生命」。选择回血技能并核对通常或应对分支，填写实际最大生命回复比例与完整回血飘字；未知应对保留两个范围。确认没有回满截断且核对回复增减益后添加，无需我方档案。计算结果为当时本体生命，不重复乘外观或骰面倍率。与捕后生命、性格和天分的换算尚未校准，当前仅测生命范围，不据此判断生命性格加成。第二条更新为42级伊雷龙应激反应回血48后已重新纳入，并加入幽铃回合末10%回血20；H₀+22按向下取整复现四条样本的43、48、38、20，暂保留为候选；+21同样匹配四条，尚未唯一确认常数22，生命提升性格及异色等情况仍待实测。</p><h3>恶念交换与生命</h3><p>我方使用「恶念交换」后，只需填写对方交换前后的血量百分比、本次实际回血飘字和额外特性生命倍率。无需我方档案。非100%的前后读数分别按上下0.5个百分点的闭区间匹配，例如10%为9.5%–10.5%，90%为89.5%–90.5%；100%只按实际满血。交换到满血也可以测算。特性和龙龙骰可能改变破盾后血量，请填写本次实际读数，勿混入其他回血、扣血或生命上限变化。</p><p>添加后点击「判断加成」，自动按当前本体候选匹配生命加成，无需选择百分比口径、回血取整或加成对照。结果仍为待校准模型下的倾向；外观、对方骰面和特性倍率只在参考值上各计一次，不再乘到反算范围上。六条用户实测均与当前区间相容，包含生命不变与降低，尚缺生命提升和异色的直接验证。42级深蓝鲸温顺10%→90%回血206，可由258生命、25→231点解释。旧记录保持原口径，保存修改后采用新规则并保留修改历史。全部数字输入框仅接受手动输入或粘贴，滚轮、上下方向键和原生增减按钮不再调整数值。</p><h3>骰面与修改</h3><div class="guide-note"><b>龙龙骰效果来源不一定可靠，请核对游戏内实际数据后再测算。</b></div><p>双方各选实际掷中的效果，四个备选骰面不会同时叠加。「未记录」暂按零加成试算，不代表实际没有加成。更改骰面后，受影响的旧观测可能转为存档。每条观测可点「修改」，保存后重新判断。</p></section>
  <section class="guide-section" id="guide-results" tabindex="-1"><h2><span>04</span>怎样看结果</h2><dl class="guide-definitions"><div><dt>是 / 否</dt><dd>由当前表情对应的性格范围直接得出。</dd></div><div><dt>倾向：是 / 倾向：否</dt><dd>来自当前战斗候选模型，只表示这些已填条件下的试算倾向。</dd></div><div><dt>暂不能判断</dt><dd>可能是缺少对应通道的观测、多种解释都成立，或模型不能解释记录。请核对条件并补充实测。</dd></div><div><dt>表情得出</dt><dd>物防、速度仅在对应表情指示时显示，无需填写其他信息。困倦判物防提升，怯懦、暴怒判速度提升；开心保留物防或速度二选一。平和、未看清时隐藏这两项，战斗记录不会替它们消除歧义。</dd></div><div><dt>判别成功 / 不匹配</dt><dd>用于提示当前支持范围内的性格提升项；表情结论注明来源，不等于完整性格或天分都已确认。</dd></div></dl><p><b>${escape(INFERENCE_SCOPE_NOTICE)}</b>战斗试算的“判别成功”仅指生命、物攻、魔攻提升项；物防、速度的“判别成功”只来自表情指示，并注明“表情得出”。不代表完整性格、六维数值或天分已确认。</p><p>三个通道分别判断，不用生命观测代推物攻，也不用物攻观测代推魔攻。全部记录还会做同一性格的一致性核对；候选数量不是概率。多种情况都适用时，按本项记录分别列出外观模板与性格影响的可能搭配；例如“非异色攻击模板＋魔攻提升”与“异色攻击模板＋魔攻降低”。列出的分支来自现有候选，不额外扩大所选外观或修改公式，也不能据此确认实际外观。</p></section>
  <section class="guide-section" id="guide-backup" tabindex="-1"><h2><span>05</span>保存与分享</h2><p>点击「导入备份」或「导入 JSON」会打开导入窗口。把 JSON 备份拖入窗口的虚线区域，或点击「选择文件」；每次一个文件，精灵池最大2MB、测算记录最大25MB。文件仅在本机读取，格式无效时原数据保持不变。</p><p>测算 JSON 与观测 CSV 附带当前支持范围；旧版双防、速度推算只保留为历史快照，不能作为当前有效结论。含精灵池网页保留同一范围说明。</p><p>测算采用手动保存。添加、修改、删除观测或判断加成后，点击醒目的「保存测算」才会写入记录；已有记录也需再次保存才会更新。名称可留空，默认用保存时的日期和时间命名，也可填写自定义名称、备注及捕后对照。切换页面会暂留当前输入，刷新或关闭网页会丢失未保存内容。到「测算记录」可继续测试、修改、搜索或导出。</p><dl class="guide-definitions"><div><dt>精灵池 JSON</dt><dd>在「我的精灵池」导出和导入个人精灵档案。</dd></div><div><dt>测算记录 JSON</dt><dd>在「测算记录」导出全部 JSON，保留完整观测、条件与修改历史，适合备份和重新导入。</dd></div><div><dt>观测 CSV</dt><dd>每条观测一行，便于查看和分析；恢复测算请使用 JSON。</dd></div><div><dt>含精灵池网页</dt><dd>会附带你主动导出的个人精灵池，测算记录需另行导出。发送前确认其中没有不想分享的档案。</dd></div></dl><div class="guide-note">数据保存在当前浏览器中。换浏览器、网页地址或文件位置前先导出备份；清除浏览器数据也可能清除记录。出现保存失败提示时立即导出。</div></section>
  <section class="guide-section" id="guide-rules" tabindex="-1"><h2><span>06</span>计算规则与校验</h2><div class="guide-note"><b>${escape(INFERENCE_SCOPE_NOTICE)}</b><p>${escape(INFERENCE_SCOPE_DETAIL)}</p></div><p>当前模型用于辅助研究，并非官方战斗实现。已参与模型选择的样本属于回代核对，不能作为独立盲测证明。</p><details><summary>等级、星级与成长参考</summary><p>以下公式用于已知等级、星级、性格与资质的面板正算和对照；不能直接倒用为龙棋士物防、魔防或速度的反推公式。</p><p>L为等级，S为星级，B为种族值，I为资质，令 X=B+I×(S+1)/2。</p><code>生命 = round((round((2L+50)×X/100)+L+10)×性格)+20S</code><code>其余 = round((round((L+50)×X/100)+10)×性格)+10S</code><p>性格提升系数为1+(10+2S)/100，降低系数为0.9。我方优先采用游戏实际面板；旧60级5星模板不能代替任意等级和星级。</p></details><details><summary>伤害候选与外观换算</summary><code>A战 = round((2A₀+22)×M)</code><code>伤害 = floor(A战×计算威力×(0.45L+10)/41÷实际防御×最终倍率)</code><p>A₀取同等级、0星、零攻击天分且保留性格的参考攻击。非异色候选M=1，异色候选M=1.2。普通/混乱、奇异/污染暂共用非异色候选；这不表示捕捉后的天分必为0。</p><p>从基础威力处理固定加值、本系、相克、骰面与本回合修正，中间威力保留小数。5星以上的本系、极化和钝化仍为候选，非中性相克才计入相应修正。物防、魔防、速度的战斗反推公式尚未完成校准，目前不提供相关反推结论。</p><p>「双攻＋40%（指定条件）」仅为玩家指定的样本试算条件，不代表已确认某个骰面原文，也不会自动作用于其他对局。</p></details><details open><summary>异色样本较少与相同伤害的多种解释</summary><p>当前异色数据较少，破盾后外观与护盾战斗攻击模板的对应尚未完成校准。部分非异色记录需要约1.2倍模板才能解释，另一些又符合1倍；目前保留现有公式，不统一追加倍率。</p><div class="guide-table-wrap"><table class="guide-table"><thead><tr><th>深蓝鲸等级</th><th>异色模板＋降低魔攻</th><th>非异色模板＋提升魔攻</th></tr></thead><tbody><tr><td>41级</td><td>战斗魔攻286</td><td>战斗魔攻286</td></tr><tr><td>42级</td><td>战斗魔攻288</td><td>战斗魔攻288</td></tr><tr><td>43级</td><td>战斗魔攻293</td><td>战斗魔攻292</td></tr></tbody></table></div><p>表中是同等级0星零攻击天分参考按当前候选换算的战斗魔攻，不是捕捉后面板。41、42级的两种搭配在其他条件相同时完全同伤；43级虽差1，最终伤害也可能因取整相同。仅靠这类读数不能选定唯一搭配。</p><p><b>欢迎大家投稿实测数据，并跟进 GitHub 版本迭代。</b>请通过 <a href="https://github.com/Kyrshu-u/roco-observatory/issues" target="_blank" rel="noopener noreferrer">GitHub Issues 投稿 ↗</a> 附测算JSON及必要截图，记录目标等级、实际表情、破盾前体型与骰子图标、破盾后外观及是否使用改色骰、战斗阶段、技能单段飘字、我方实际双防和星级、双方骰面及额外增减益。捕后性格与天分请标明已确认或未知，发出前检查个人信息。可在 <a href="https://github.com/Kyrshu-u/roco-observatory" target="_blank" rel="noopener noreferrer">GitHub 仓库 ↗</a> 跟进后续说明与版本；文档更新不表示现有HTML已同步替换。</p></details><details><summary>状态、护盾生命与冻结</summary><p>当前状态选项沿用寄生2%、灼烧2%、中毒3%的工作规则，比例不支持随意改写。状态、相克、层数和取整仍需按实战核对。</p><code>护盾生命候选 = (2H₀+44)×外观倍率×骰面生命倍率</code><p>H₀取同等级、0星、生命天分0且保留性格的参考生命；异色生命倍率与攻击倍率分别处理。当前护盾模型仅有41–43级少量兼容样本，其他等级属于外推。冻结以20层结算前剩余血量区间筛选，旧记录仍保留原来的结算口径。</p></details><details><summary>实测核验能说明什么</summary><p>蛋包蛋样本的捕后六维可以按参考公式复算，但这不等于龙棋士战斗模板已被验证。此前混用战斗显示威力的直接伤害推算已撤回。</p><p>深蓝鲸、伊雷龙和星尘虫样本用于当前候选的拟合与复算；技能条件未确认、骰面指定条件和模糊飘字均单独保留。捕后性格作独立对照，不回填成反推成功。</p><p>资料中的「双源一致」仅表示两个来源的数值相同，不表示实战准确或已取得再分发授权。</p></details></section>
@@ -1063,7 +1148,7 @@ const EFFECTS=Object.freeze({leech:Object.freeze({name:'寄生',percent:2,type:'
 const STATUS_RULES_VERSION='2026-11-08-freeze-percent-v2';
 const LEGACY_STATUS_RULES_VERSION='2026-11-07-community-reference';
 const PREVIOUS_STATUS_RULES_VERSION='2026-11-08-status-candidates-v1';
-const INFERENCE_VERSION='2026-11-09-attack-rounding-v6';
+const INFERENCE_VERSION='2026-11-09-hp-exchange-v8';
 const SHIELD_SKILLS=[...new Map(Object.entries(SKILLS).filter(([,s])=>shieldRule(s)).map(([id,s])=>[JSON.stringify([s.name,s.type,s.category,s.power,s.energy,s.descriptionKey??s.desc]),id])).values()];
 const skillEffects=s=>Array.isArray(s?.statusEffects)?s.statusEffects:Object.entries(EFFECTS).filter(([k,e])=>(s?.desc||'').includes(k==='freeze'?'冻结':e.name)).map(([k])=>k);
 const skillChannel=s=>s?.category==='物攻'?'physical':s?.category==='魔攻'?'magical':null;
@@ -1090,7 +1175,7 @@ function currentGroup(){return state.groups.find(g=>g.profileId===state.profileI
 function attachGroup(o){
  const profile=selectedProfile();let g=currentGroup();
  if(!g){g={id:crypto.randomUUID?.()||String(Date.now()),profileId:profile?.id||'',name:profile?profileName(profile):'未指定我方精灵',profile:profile?structuredClone(profile):null};state.groups.push(g);}
- if(o.kind!=='recovery'&&Object.values(state.dice).some(d=>o.kind==='percentage'?diceEffect(d.catalogId)?.archiveStatus:diceEffect(d.catalogId)?.archiveDirect)&&o.kind!=='stat'){o.included=false;o.disabledReason='骰面包含独立结算、随机效果或待核对乘区，请分开复核；本条仅存档';}
+ if(!['recovery','hp-exchange'].includes(o.kind)&&Object.values(state.dice).some(d=>o.kind==='percentage'?diceEffect(d.catalogId)?.archiveStatus:diceEffect(d.catalogId)?.archiveDirect)&&o.kind!=='stat'){o.included=false;o.disabledReason='骰面包含独立结算、随机效果或待核对乘区，请分开复核；本条仅存档';}
  if(o.kind==='incoming'&&o.powerFactors?.superPending){o.included=false;o.disabledReason='克制骰面的倍率口径尚未确认';}
  o.targetLevel=state.targetLevel;o.targetStars=0;o.targetFormula=state.targetFormula;o.groupId=g.id;o.profile=profile?structuredClone(profile):null;o.profilePanel=profile?structuredClone(profilePanel(profile)):null;o.profileSpecies=profile?speciesSnapshot(pet(profile.petId)):null;o.skillSnapshot=o.skill?structuredClone(SKILLS[o.skill]):null;o.phase=state.phase;o.conditionsConfirmed=true;o.combatModel=COMBAT_MODEL_VERSION;o.targetAppearance=state.targetAppearance;if(o.kind!=='percentage')o.appearance=state.targetAppearance;return o;
 }
@@ -1109,7 +1194,7 @@ function updateObservationAppearance(value){
    else if(Object.values(o.dice||{}).some(d=>o.kind==='percentage'?diceEffect(d.catalogId)?.archiveStatus:diceEffect(d.catalogId)?.archiveDirect)||o.powerFactors?.superPending){o.included=false;o.disabledReason='骰面乘区尚未核实，本条仅存档';}
    if(o.included!==false)o.appearanceInvalidationRepaired=true;
   }
-  if(o.included===false||!['incoming','percentage'].includes(o.kind)||o.appearance==='custom')continue;
+  if(o.included===false||!['incoming','percentage','hp-exchange'].includes(o.kind)||o.appearance==='custom')continue;
   if(o.appearance!==value)o.originalAppearance??=o.appearance??o.targetAppearance??'unknown';
   o.targetAppearance=value;o.appearance=value;
   if(o.kind==='percentage')o.hpMultiplier=value==='shiny'?1.5:value==='normal'?1:null;
@@ -1141,7 +1226,7 @@ function hero(title,subtitle,eyebrow='S5 · 圣龙宝藏 / FIELD RESEARCH',artPe
 function heading(no,title,subtitle='',right=''){return `<div class="card-head"><div class="section-title"><span class="section-no">${no}</span><div><h2>${title}</h2>${subtitle?`<div class="card-subtitle">${subtitle}</div>`:''}</div></div>${right}</div>`;}
 function render(){
   syncTargetHpAppearance();
-  if(state.phase==='body')state.observationTab='recovery';else if(state.observationTab==='recovery')state.observationTab='incoming';
+  if(state.phase==='body'){if(!['recovery','hp-exchange'].includes(state.observationTab))state.observationTab='recovery';}else if(['recovery','hp-exchange'].includes(state.observationTab))state.observationTab='incoming';
   document.body.dataset.view=state.page;
   $$('nav button').forEach(b=>b.classList.toggle('active',b.dataset.page===state.page));$('#pool-count').textContent=pool.length;$('#record-count').textContent=records.length;
   $('#app').innerHTML=state.page==='infer'?renderInfer():state.page==='pool'?renderPool():state.page==='records'?renderRecords():state.page==='library'?renderLibrary():renderAbout();
@@ -1157,8 +1242,8 @@ function renderInfer(){
     <section class="card partner-card ${profile?'':'is-empty'}">${heading('03','我方精灵','','<button class="text-button" data-action="new-profile">＋ 新建</button>')}<div class="card-body">${profile?`<button class="saved-picker" data-action="pick-profile">${art(pet(profile.petId))}<div><h3>${esc(profile.nickname||pet(profile.petId).name)}</h3><p>${profile.level?profile.level+' 级 · ':''}${profile.stars} 星</p></div><span class="picker-arrow">⌄</span></button><div class="partner-defense-row"><div class="partner-defenses"><span>物防 <b>${profilePanel(profile).def??'—'}</b></span><span>魔防 <b>${profilePanel(profile).spd??'—'}</b></span></div><button class="text-button" data-action="edit-profile" data-id="${profile.id}">编辑档案</button></div>`:`<button class="saved-picker" data-action="new-profile"><span class="pet-placeholder">＋</span><div><h3>添加常用伙伴</h3><p>填写星级与实际双防</p></div></button><div class="target-info"><span class="subtle">档案保存在本机</span><button class="example-link" data-action="sample-profile">载入截图示例</button></div>`}</div></section>
     <button class="btn primary mobile-next" data-action="infer-tab" data-id="battle">${expressionHint?'继续记录战斗（可选）→':'记录战斗 →'}</button>
   </div>
-  <section class="card battle-card" data-infer-pane="battle">${heading('04','战斗观测','',`<div class="obs-tools"><button class="text-button" data-action="dice-settings">龙龙骰 / 威力</button><button class="text-button" data-action="export-result">导出</button><span class="tiny-tag">${state.groups.length}组 · ${state.observations.length}条</span>${state.observations.length?'<button class="text-button reset-obs" data-action="clear-obs">清空</button>':''}</div>`)}<div class="card-body">${groupBar()}${encounterDice()}<div class="tabs">${(state.phase==='body'?[['recovery','回血 / 生命']]:[['incoming','它打我方'],['percentage','状态扣血 / 生命']]).map(([id,text])=>`<button class="tab ${state.observationTab===id?'active':''}" data-action="obs-tab" data-id="${id}">${text}</button>`).join('')}</div>${observationForm()}
-    <div class="observation-list">${state.observations.map((o,i)=>({o,i})).filter(({o})=>state.allGroups||o.groupId===currentGroup()?.id||!o.groupId).map(({o,i})=>`<div class="obs-row">${o.skill?skillArt(SKILLS[o.skill]):'<span class="obs-icon">◇</span>'}<span><small>${esc(state.groups.find(g=>g.id===o.groupId)?.name||'旧记录')} · ${o.phase==='shield'?'护盾':'本体'}${o.included===false?' · '+(o.disabledReason||'仅存档'):''}</small>${esc(o.label)}</span><div class="obs-row-actions">${['incoming','percentage','recovery'].includes(o.kind)?`<button type="button" class="edit-obs-button" data-action="edit-obs" data-id="${i}" aria-label="修改此条观测">修改</button>`:''}<button type="button" data-action="remove-obs" data-id="${i}" aria-label="移除此条观测">×</button></div></div>`).join('')||'<div class="observations-empty">暂无记录</div>'}</div>
+  <section class="card battle-card" data-infer-pane="battle">${heading('04','战斗观测','',`<div class="obs-tools"><button class="text-button" data-action="dice-settings">龙龙骰 / 威力</button><button class="text-button" data-action="export-result">导出</button><span class="tiny-tag">${state.groups.length}组 · ${state.observations.length}条</span>${state.observations.length?'<button class="text-button reset-obs" data-action="clear-obs">清空</button>':''}</div>`)}<div class="card-body">${groupBar()}${encounterDice()}<div class="tabs">${(state.phase==='body'?[['recovery','回血 / 生命'],['hp-exchange','恶念交换 / 生命']]:[['incoming','它打我方'],['percentage','状态扣血 / 生命']]).map(([id,text])=>`<button class="tab ${state.observationTab===id?'active':''}" data-action="obs-tab" data-id="${id}">${text}</button>`).join('')}</div>${observationForm()}
+    <div class="observation-list">${state.observations.map((o,i)=>({o,i})).filter(({o})=>state.allGroups||o.groupId===currentGroup()?.id||!o.groupId).map(({o,i})=>`<div class="obs-row">${o.skill?skillArt(SKILLS[o.skill]):'<span class="obs-icon">◇</span>'}<span><small>${esc(state.groups.find(g=>g.id===o.groupId)?.name||'旧记录')} · ${o.phase==='shield'?'护盾':'本体'}${o.included===false?' · '+(o.disabledReason||'仅存档'):''}</small>${esc(o.label)}</span><div class="obs-row-actions">${['incoming','percentage','recovery','hp-exchange'].includes(o.kind)?`<button type="button" class="edit-obs-button" data-action="edit-obs" data-id="${i}" aria-label="修改此条观测">修改</button>`:''}<button type="button" data-action="remove-obs" data-id="${i}" aria-label="移除此条观测">×</button></div></div>`).join('')||'<div class="observations-empty">暂无记录</div>'}</div>
     <div class="run-row"><button class="btn primary run-btn" data-action="calculate">判断加成 →</button></div></div></section>
   <aside class="results card" data-infer-pane="result" aria-live="polite">${renderResults()}</aside></div>`;
 }
@@ -1166,9 +1251,34 @@ function renderInfer(){
 function recoverySkillRule(skill){
  return skillRecovery(skill);
 }
+function exchangeFields(o={},editing=false){
+ const prefix=editing?'edit-obs':'obs',number=(key,label,value,placeholder='')=>`<div><label for="${prefix}-${key}">${label}</label><input id="${prefix}-${key}" name="${key}" type="number" min="0" max="100" step="any" required value="${value??''}" placeholder="${placeholder}"></div>`;
+ return `${number('beforePercent','交换前对方血量 %',o.beforePercent,'通常约10%，按本次实际填写')}${number('afterPercent','交换后对方血量 %',o.afterPercent,'确认交换后的读数')}<div><label for="${prefix}-damage">对方本次回血飘字</label><input id="${prefix}-damage" name="damage" type="number" min="1" max="9999999" step="1" required value="${o.damage??''}" placeholder="仅交换造成的实际回血"></div><div><label for="${prefix}-traitHpMultiplier">额外特性生命倍率</label><input id="${prefix}-traitHpMultiplier" name="traitHpMultiplier" type="number" min="0.001" max="100" step="any" required value="${o.traitHpMultiplier??1}"></div><p class="wide subtle">非100%的前后血量各按读数上下0.5个百分点匹配，例如90%按89.5%–90.5%；100%按满血。自动测算生命范围并判断生命加成倾向。特性、龙龙骰可能改变破盾后血量，请填写本次实际读数。</p>`;
+}
+function exchangeForm(){
+ return `<form id="observation-form" class="status-observation-form"><p class="notice green">我方使用「恶念交换」后，填写对方交换前后的血量与本次回血飘字；交换到满血也可计算。无需我方档案。</p><div class="observation-form">${exchangeFields()}<label class="checkbox-label wide"><input name="confirmed" type="checkbox" required><span>已核对对方前后血量与特性、龙龙骰影响；飘字只含本次交换，期间没有其他回血、扣血或生命上限变化。</span></label></div>${observationAddAction()}</form>`;
+}
+function exchangeValues(values){
+ return {...Object.fromEntries(['beforePercent','afterPercent','damage','traitHpMultiplier'].map(k=>[k,values[k]===''?NaN:Number(values[k])])),exchangeRulesVersion:HP_EXCHANGE_RULES_VERSION,percentTolerance:.5,hpComparisonModel:BODY_HP_COMPARISON_MODEL};
+}
+function exchangeLabel(o){return `恶念交换 · ${o.beforePercent}%→${o.afterPercent}% · 回血${o.damage}`;}
+function renderExchangeEditor(){
+ const o=observationEditor.original;
+ modal('修改恶念交换记录',`<form id="observation-edit-form" class="edit-form"><p class="notice green">沿用本条外观与对方骰面生命倍率×${o.diceHpMultiplier}；保存修改后按非100%读数±0.5个百分点匹配，100%按满血。修改后重新判断并手动保存。</p><div class="edit-observation-grid">${exchangeFields(o,true)}</div><label class="checkbox-label"><input name="included" type="checkbox" ${o.included!==false?'checked':''}><span>参与生命测算</span></label><label class="checkbox-label"><input name="confirmed" type="checkbox" required><span>已重新核对本次交换读数、飘字与生命变化。</span></label><p id="edit-observation-error" class="form-error" role="status"></p><div class="modal-footer"><button type="button" class="btn" data-action="close-modal">取消</button><button type="submit" class="btn primary">保存修改</button></div></form>`,'observation-edit-modal');
+ observationEditor.initial=observationEditorValues();
+}
+function saveExchangeEdit(){
+ const {index,original}=observationEditor,values=observationEditorValues(),o={...structuredClone(original),...exchangeValues(values)};o.min=o.max=o.damage;o.included=values.included;o.conditionsConfirmed=values.confirmed;
+ for(const key of ['minePercent','percentMode','rounding'])delete o[key];
+ if(JSON.stringify(state.observations[index])!==JSON.stringify(original)){$('#edit-observation-error').textContent='这条记录已变化，请重新打开修改。';return;}
+ if(!hpExchangeRanges(o).length||!validResearchRecord({format:'roco-research-record',version:RESEARCH_RECORD_VERSION,targetId:state.targetId,observations:[o]})){$('#edit-observation-error').textContent='请填写有效的回血与前后百分比；交换后血量须高于交换前，并重新确认条件。';return;}
+ o.label=exchangeLabel(o);if(o.included)delete o.disabledReason;else o.disabledReason='手动仅存档';
+ const {editHistory,...previous}=original;o.editHistory=[...(editHistory||[]),{editedAt:new Date().toISOString(),observation:previous}];
+ const form=observationFormSnapshot();state.observations[index]=o;state.result=null;$('#modal').close();observationEditor=null;render();restoreObservationForm(form);rememberEncounterForm();toast('交换记录已修改；请重新判断并手动保存测算');
+}
 function recoveryForm(){
  const unique=new Map();for(const [id,s] of Object.entries(SKILLS)){const rule=recoverySkillRule(s);if(rule&&!unique.has(s.name))unique.set(s.name,[id,s,rule]);}
- return `<form id="observation-form" class="status-observation-form"><p class="notice green">破盾后对方不会攻击，只会使用状态技能、盾和聚能。此阶段只能通过百分比回血与完整回血飘字测算本体生命。盾、聚能等无生命回复的技能不提供数值约束。</p><div class="observation-form"><div class="wide"><label for="obs-recovery-skill">对方回血技能</label><select id="obs-recovery-skill" name="recoverySkill"><option value="">其他回复 · 手填实际比例</option>${[...unique.values()].map(([id,s,r])=>`<option value="${id}">${esc(s.name)} · ${r.normal}%${r.response?' / 应对'+r.response+'%':''}</option>`).join('')}</select></div><div><label for="obs-heal-response">本次回复条件</label><select id="obs-heal-response" name="healResponse"><option value="normal">通常效果</option><option value="response">已触发应对回复</option><option value="unknown">应对未确认 · 保留两种比例</option></select></div><div><label for="obs-heal-percent">实际最大生命回复比例 %</label><input id="obs-heal-percent" name="healPercent" type="number" min="0.01" max="100" step="any" required placeholder="按本次游戏说明填写"></div><div><label for="obs-damage">完整回血飘字</label>${damageInput()}</div><div><label for="obs-rounding">回血取整</label><select id="obs-rounding" name="rounding"><option value="unknown">未确认 · 保留取整范围</option><option value="floor">向下取整</option><option value="round">四舍五入</option><option value="ceil">向上取整</option></select></div><p id="recovery-rate-note" class="wide subtle">计算：回血量 ÷ 实际回复比例；结果已是当时的本体生命，不再重复乘外观或骰面倍率。</p><label class="checkbox-label wide"><input name="confirmed" type="checkbox" required><span>回血未回满截断，飘字只含本次百分比回复，已核对技能分支、回复增减益及生命变化。</span></label></div>${observationAddAction()}</form>`;
+ return `<form id="observation-form" class="status-observation-form"><p class="notice green">破盾后对方不会攻击，只会使用状态技能、盾和聚能。此页记录百分比回复；也可切到「恶念交换 / 生命」记录交换前后比例与回血。盾、聚能等无生命回复的技能不提供数值约束。</p><div class="observation-form"><div class="wide"><label for="obs-recovery-skill">对方回血技能</label><select id="obs-recovery-skill" name="recoverySkill"><option value="">其他回复 · 手填实际比例</option>${[...unique.values()].map(([id,s,r])=>`<option value="${id}">${esc(s.name)} · ${r.normal}%${r.response?' / 应对'+r.response+'%':''}</option>`).join('')}</select></div><div><label for="obs-heal-response">本次回复条件</label><select id="obs-heal-response" name="healResponse"><option value="normal">通常效果</option><option value="response">已触发应对回复</option><option value="unknown">应对未确认 · 保留两种比例</option></select></div><div><label for="obs-heal-percent">实际最大生命回复比例 %</label><input id="obs-heal-percent" name="healPercent" type="number" min="0.01" max="100" step="any" required placeholder="按本次游戏说明填写"></div><div><label for="obs-damage">完整回血飘字</label>${damageInput()}</div><div><label for="obs-rounding">回血取整</label><select id="obs-rounding" name="rounding"><option value="unknown">未确认 · 保留取整范围</option><option value="floor">向下取整</option><option value="round">四舍五入</option><option value="ceil">向上取整</option></select></div><p id="recovery-rate-note" class="wide subtle">计算：回血量 ÷ 实际回复比例；结果已是当时的本体生命，不再重复乘外观或骰面倍率。</p><label class="checkbox-label wide"><input name="confirmed" type="checkbox" required><span>回血未回满截断，飘字只含本次百分比回复，已核对技能分支、回复增减益及生命变化。</span></label></div>${observationAddAction()}</form>`;
 }
 function updateRecoveryFields(reset=true){
  const select=$('#obs-recovery-skill'),percent=$('#obs-heal-percent');if(!select||!percent)return;
@@ -1179,15 +1289,15 @@ function updateRecoveryFields(reset=true){
  $('#recovery-rate-note').textContent=unknown?`应对未确认，分别按${rule.normal}%和${rule.response}%计算两个生命范围；不合并成连续区间。`:'回血量 ÷ 实际回复比例。结果为当时本体生命；不再重复乘外观或骰面倍率。';
 }
 function recoverySummary(){
- const entries=state.observations.filter(o=>o.kind==='recovery'&&o.included!==false).map(o=>({o,ranges:recoveryHpRanges(o)}));
+ const entries=state.observations.filter(o=>['recovery','hp-exchange'].includes(o.kind)&&o.included!==false).map(o=>({o,ranges:o.kind==='hp-exchange'?hpExchangeRanges(o):recoveryHpRanges(o)}));
  let common=null;
- for(const {ranges} of entries){common=common===null?ranges.map(r=>[r.min,r.max]):common.flatMap(([a,b])=>ranges.map(r=>[Math.max(a,r.min),Math.min(b,r.max)]).filter(([a,b])=>a<=b));}
+ for(const {ranges} of entries){common=common===null?ranges.map(r=>[r.min,r.max??Infinity]):common.flatMap(([a,b])=>ranges.map(r=>[Math.max(a,r.min),Math.min(b,r.max??Infinity)]).filter(([a,b])=>a<=b));}
  return {entries,common};
 }
 function renderRecoveryResults(){
  const {entries,common}=recoverySummary();if(!entries.length)return '';
- const label=r=>r[0]===r[1]?String(r[0]):r.join('–');
- return `<div class="recovery-results"><h3>破盾后本体生命</h3>${entries.map(({o,ranges})=>`<p>${esc(o.skillName||'百分比回复')} · 回血${o.damage}：${ranges.map(r=>`${r.percent}% → <strong>${label([r.min,r.max])}</strong>`).join('；')}</p>`).join('')}${entries.length>1?`<p class="notice ${common?.length?'green':''}">${common?.length?'同一生命上限的共同范围：'+[...new Set(common.map(label))].join(' 或 '):'这些回复记录没有共同生命上限。请核对回复分支、取整及记录间生命是否变化。'}</p>`:''}<p class="subtle">范围来自完整百分比回血。与捕后生命、性格和天分的换算尚未校准，当前不据此判定生命性格加成。</p></div>`;
+ const label=r=>r[1]===null||r[1]===Infinity?`${r[0]}以上`:r[0]===r[1]?String(r[0]):r.join('–');
+ return `<div class="recovery-results"><h3>破盾后本体生命</h3>${entries.map(({o,ranges})=>`<p>${esc(o.skillName||'百分比回复')}${o.kind==='hp-exchange'?` · ${o.beforePercent}%→${o.afterPercent}%`:''} · 回血${o.damage}：${ranges.map(r=>`${r.percent}% → <strong>${label([r.min,r.max])}</strong>`).join('；')}</p>`).join('')}${entries.length>1?`<p class="notice ${common?.length?'green':''}">${common?.length?'同一生命上限的共同范围：'+[...new Set(common.map(label))].join(' 或 '):'这些回复记录没有共同生命上限。请核对回复分支、取整及记录间生命是否变化。'}</p>`:''}<p class="subtle">新交换记录的非100%读数按±0.5个百分点匹配，100%按满血；自动按本体候选给出生命加成倾向。旧记录保留原口径，普通回复仍只测生命范围。</p></div>`;
 }
 function renderRecoveryEditor(){
  const o=observationEditor.original;
@@ -1207,12 +1317,12 @@ function saveRecoveryEdit(){
 }
 
 function observationForm(){
- if(state.phase==='body')return recoveryForm();
+ if(state.phase==='body')return state.observationTab==='hp-exchange'?exchangeForm():recoveryForm();
  if(state.observationTab==='percentage')return `<form id="observation-form" class="status-observation-form"><div class="observation-form">${percentageFields()}</div>${observationAddAction()}</form>`;
  const ids=pet(state.targetId).skills;
  return `<form id="observation-form" class="incoming-observation-form"><div class="observation-form"><div class="skill-field"><label for="obs-skill-button">对方攻击技能 <span id="obs-channel-label" class="subtle"></span></label><button type="button" class="skill-slot" id="obs-skill-button" data-action="pick-observation-skill"><span class="skill-icon missing-icon">◇</span><span>选择攻击技能</span><small>⌕</small></button><select id="obs-skill" name="skill" hidden><option value=""></option>${ids.map(k=>`<option value="${k}">${esc(SKILLS[k].name)}</option>`).join('')}</select></div><div class="damage-field"><label for="obs-damage">受伤飘字（连击仅填单段伤害） ${help('damage')}</label>${damageInput(true)}</div>${incomingConditionFields()}<p class="wide combo-record-note">同条件同数值只需记录一段；各段条件不同再分别补录。额外连击数不加入最终倍率。</p><p class="wide extra-damage-reminder">请按效果原文区分威力、攻防变化与独立伤害倍率。只有独立增伤25%才在已有最终倍率上再乘1.25；双攻变化请填对方对应属性修正。</p><details class="observation-advanced wide"><summary>计算修正</summary><div class="status-extra-grid"><div><label for="obs-power">基础威力 ${help('power')}</label><input id="obs-power" name="power" type="number" min="0.01" max="100000" step="any" required></div><div><label for="obs-multiplier">最终倍率 ${help('multiplier')}</label><input id="obs-multiplier" name="multiplier" type="number" min="0.001" max="100" value="1" step="any" required></div></div></details><label class="checkbox-label wide"><input name="confirmed" type="checkbox" required><span>已核对本次增减益</span></label></div><div id="skill-note" hidden></div>${observationAddAction(true)}</form>`;
 }
-function observationAddAction(disabled=false){return `<p id="observation-reminder" class="observation-reminder" role="status" ${state.missingObservation?'':'hidden'}>请先填写飘字并点击“添加记录”，再判断加成。仅存档的观测不会参与判别。</p><div class="form-actions-line observation-add-line"><span>填单次飘字后添加；相同连击段无需重复</span><button class="btn primary add-observation" id="add-damage" type="submit" ${disabled?'disabled':''}><span aria-hidden="true">＋</span> 添加记录</button></div>`;}
+function observationAddAction(disabled=false){return `<p id="observation-reminder" class="observation-reminder" role="status" ${state.missingObservation?'':'hidden'}>请先填写飘字并点击“添加记录”，再判断加成。仅存档的观测不会参与判别。</p><div class="form-actions-line observation-add-line"><span>${state.phase==='body'?'核对本次血量与回血后添加':'填单次飘字后添加；相同连击段无需重复'}</span><button class="btn primary add-observation" id="add-damage" type="submit" ${disabled?'disabled':''}><span aria-hidden="true">＋</span> 添加记录</button></div>`;}
 function damageInput(singleHit=false){return `<input id="obs-damage" name="damage" type="number" min="0" max="9999999" step="1" required aria-label="${singleHit?'实际受伤飘字（连击仅填单段伤害）':'实际飘字'}" placeholder="${singleHit?'单段完整整数伤害':'完整整数飘字'}">`;}
 function percentageFields(){return `<div class="status-effect-field"><label for="obs-effect">状态技能 / 效果 ${help('status')}</label><select id="obs-effect" name="effect">${Object.entries(EFFECTS).map(([k,v])=>`<option value="${k}" ${k==='burn'?'selected':''}>${v.name}${v.percent?' · 每层'+v.percent+'%':' · 20层结算'}</option>`).join('')}</select></div><div><label for="obs-layers">结算层数</label><input id="obs-layers" name="layers" type="number" min="1" max="999" step="1" value="1" required></div><div><label for="obs-damage">扣血飘字 ${help('damage')}</label>${damageInput()}</div>${appearanceFields()}<div id="freeze-fields" class="wide" hidden><label for="obs-remaining-percent">冻结结算前剩余血量 %</label><input id="obs-remaining-percent" name="remainingPercent" type="number" min="0" max="100" step="1" value="100" required disabled><p id="freeze-percent-note" class="appearance-note">100%按满血计算。</p></div><details class="observation-advanced wide"><summary>生命换算 ${help('hp')}</summary><div class="status-extra-grid"><div><label for="obs-hp-model">参考模型</label><select id="obs-hp-model" name="hpModel"><option value="field" ${state.phase==='shield'?'selected':''}>护盾生命：2H₀+44</option><option value="ordinary" ${state.phase==='body'?'selected':''}>普通本体参考：H</option><option value="archive">仅存档</option></select></div><div><label for="obs-rounding">扣血取整</label><select id="obs-rounding" name="rounding"><option value="unknown">未确认</option><option value="layer-floor">每层向下取整</option><option value="floor">总量向下取整</option><option value="round">总量四舍五入</option><option value="ceil">总量向上取整</option></select></div></div></details><label class="checkbox-label wide"><input name="confirmed" type="checkbox" required><span id="percentage-confirm">已核对本次层数与飘字</span></label>`;}
 function incomingConditionFields(){return `<div class="wide incoming-conditions"><div id="response-field" hidden><label for="obs-responded">是否被应对 ${help('response')}</label><select id="obs-responded" name="responded" disabled><option value="no">否 · 未触发应对增伤</option><option value="yes">是 · 触发技能应对效果</option></select></div><div id="response-count-field" hidden><label for="obs-response-count">累计成功应对次数（含本次）</label><input id="obs-response-count" name="responseCount" type="number" min="0" max="999" step="1" value="0" disabled></div><div id="response-poison-field" hidden><label for="obs-response-poison">我方当前中毒层数</label><input id="obs-response-poison" name="responsePoison" type="number" min="0" max="999" step="1" value="0" disabled></div><div class="shield-choice-row wide"><div><label for="obs-shield-enabled">我方是否开盾 ${help('shield')}</label><select id="obs-shield-enabled" name="shieldEnabled"><option value="no">否 · 未开盾</option><option value="yes">是 · 已开盾</option></select></div><div id="shield-skill-field" hidden><label for="obs-shield-button">本回合盾技能</label><button type="button" class="skill-slot" id="obs-shield-button" data-action="pick-shield-skill"><span class="skill-icon missing-icon">◇</span><span>请选择实际开盾技能</span><small>⌕</small></button><select id="obs-shield-skill" name="shieldSkill" hidden disabled><option value=""></option>${SHIELD_SKILLS.map(id=>`<option value="${id}">${esc(SKILLS[id].name)}</option>`).join('')}</select></div></div><div id="shield-slot-field" hidden><label for="obs-shield-slot">盾技能所在位置</label><select id="obs-shield-slot" name="shieldSlot" disabled><option value="">请选择实际位置</option>${[1,2,3,4].map(i=>`<option value="${i}">${i}号位</option>`).join('')}</select></div><div id="shield-poison-field" hidden><label for="obs-shield-poison">敌方当前中毒层数</label><input id="obs-shield-poison" name="shieldPoison" type="number" min="0" max="999" step="1" value="0" disabled></div><p id="incoming-condition-note" class="wide incoming-condition-note" role="status" hidden></p></div>`;}
@@ -1313,7 +1423,7 @@ function updatePercentageEffect(){
 
 let observationEditor=null;
 function openObservationEditor(index){
- const original=state.observations[index];if(!original||!['incoming','percentage','recovery'].includes(original.kind))return;
+ const original=state.observations[index];if(!original||!['incoming','percentage','recovery','hp-exchange'].includes(original.kind))return;
  observationEditor={index,original:structuredClone(original)};
  renderObservationEditor();
 }
@@ -1336,6 +1446,7 @@ function filterObservationEditorSkills(id){
  select.value=selected;$('#'+id+'-filter-count').textContent=`找到 ${matches.length} 个技能${pinned?'；当前已选技能已保留':''}。`;
 }
 function renderObservationEditor(){
+ if(observationEditor.original.kind==='hp-exchange'){renderExchangeEditor();return;}
  if(observationEditor.original.kind==='recovery'){renderRecoveryEditor();return;}
  const o=observationEditor.original,incoming=o.kind==='incoming',s=o.skillSnapshot||SKILLS[o.skill],f=o.powerFactors||{},r=o.response||responseAdjustment(s),shield=o.shield||{};
  const number=(name,label,value,min=0,max=100000,step='any')=>{const singleHit=incoming&&name==='damage';return `<div><label for="edit-obs-${name}">${label}${singleHit?'（连击仅填单段伤害）':''}</label><input id="edit-obs-${name}" name="${name}" type="number" value="${value??''}" min="${min}" max="${max}" step="${step}" required${singleHit?' placeholder="单段完整整数伤害"':''}></div>`;};
@@ -1354,7 +1465,7 @@ function renderObservationEditor(){
 }
 function observationEditorValues(){return Object.fromEntries([...$('#observation-edit-form').elements].filter(f=>f.name).map(f=>[f.name,f.type==='checkbox'?f.checked:f.value]));}
 function updateObservationEditor(changed=''){
- if(observationEditor.original.kind==='recovery')return;
+ if(['recovery','hp-exchange'].includes(observationEditor.original.kind))return;
  const o=observationEditor.original,show=(id,visible)=>{const box=$('#'+id);if(!box)return;box.hidden=!visible;for(const f of $$('input,select',box))f.disabled=!visible;};
  if(o.kind==='incoming'){
   const skill=editObservationSkill(),rule=skillResponse(skill),response=responseAdjustment(skill,{enabled:$('#edit-obs-responded').value==='yes',count:Number($('#edit-obs-responseCount').value),poisonLayers:Number($('#edit-obs-responsePoison').value)});
@@ -1382,6 +1493,7 @@ function updateObservationEditor(changed=''){
  }
 }
 function saveObservationEdit(){
+ if(observationEditor.original.kind==='hp-exchange'){saveExchangeEdit();return;}
  if(observationEditor.original.kind==='recovery'){saveRecoveryEdit();return;}
  const {index,original,initial}=observationEditor,values=observationEditorValues(),o=structuredClone(original),number=k=>Number(values[k]);
  if(JSON.stringify(values)===JSON.stringify(initial)){$('#modal').close();toast('记录未修改');return;}
@@ -1424,23 +1536,23 @@ function saveObservationEdit(){
 
 function boostEstimate(){
  const expressionChecks=expressionBoostChecks(NATURES,state.expression),focus=['atk','spa','hp'],fromNatures=ns=>STATS.filter(k=>ns.some(n=>n.up===k));
- const allowed=natureSet(NATURES,state.expression),candidates=fromNatures(allowed),active=state.observations.filter(o=>o.included!==false&&!['note','recovery'].includes(o.kind));
+ const allowed=natureSet(NATURES,state.expression),candidates=fromNatures(allowed),active=state.observations.filter(o=>o.included!==false&&!['note','recovery'].includes(o.kind)&&(o.kind!=='hp-exchange'||o.hpComparisonModel===BODY_HP_COMPARISON_MODEL));
  const joint=state.result?.rows.length?state.result:null,jointConflict=!!state.result&&active.length>0&&!joint;
  const statusEffects=[...new Set(active.filter(o=>o.kind==='percentage').map(o=>EFFECTS[o.effect]?.name).filter(Boolean))];
  const checks=focus.map(stat=>{
-  const observations=active.filter(o=>o.stat===stat&&(stat==='hp'?o.kind==='percentage':o.kind==='incoming'));
+  const observations=active.filter(o=>o.stat===stat&&(stat==='hp'?['percentage','hp-exchange'].includes(o.kind):o.kind==='incoming'));
   if(!candidates.includes(stat))return {stat,answer:'否',source:'expression',status:'no',observations:observations.length,detail:'当前表情对应的性格不提升这一项。'};
   if(candidates.length===1)return {stat,answer:'是',source:'expression',status:'yes',observations:observations.length,detail:'当前表情对应的性格提升这一项。'};
-  if(!state.result||!observations.length)return {stat,answer:'暂不能判断',source:'insufficient',status:'unknown',observations:observations.length,detail:observations.length?'已有记录，点击判断后查看试算。':stat==='hp'?'添加状态层数与扣血飘字。':'添加对方对应通道的受击伤害。'};
+  if(!state.result||!observations.length)return {stat,answer:'暂不能判断',source:'insufficient',status:'unknown',observations:observations.length,detail:observations.length?'已有记录，点击判断后查看试算。':stat==='hp'?'添加状态扣血或恶念交换记录；交换加成试算需选择候选对照。':'添加对方对应通道的受击伤害。'};
   const rows=targetSolve(observations).rows,basis='independent',usedObservations=observations.length;
   if(!rows.length)return {stat,answer:'暂不能判断',source:'experimental-battle-model',status:'conflict',modelConflict:true,observations:observations.length,basis,usedObservations,detail:'当前模型不能解释本项记录，保留未知。'};
   const yes=rows.some(r=>r.nature.up===stat),no=rows.some(r=>r.nature.up!==stat);
   const appearanceHypotheses=[...new Set(rows.flatMap(r=>r.appearances||[state.targetAppearance]))];
   const appearanceCondition=state.targetAppearance==='unknown'&&appearanceHypotheses.length===1?`仅${APPEARANCE_NAMES[appearanceHypotheses[0]]}假设下有解`:'';
-  return {stat,answer:yes&&no?'暂不能判断':yes?'倾向：是':'倾向：否',source:'experimental-battle-model',status:yes&&no?'unknown':yes?'likely-yes':'likely-no',modelConflict:false,observations:observations.length,basis,usedObservations,appearanceHypotheses,appearanceCondition,compatibleScenarios:compatibleScenarios(rows,stat,state.targetAppearance),detail:`仅使用${stat==='hp'?'状态扣血':stat==='atk'?'物理受击':'魔法受击'}记录判断本项。`+(yes&&no?'提升与不提升均能解释记录。':'仅为未校准模型下的倾向，不能作为确定结论。')+(appearanceCondition?appearanceCondition+'。':'')};
+  return {stat,answer:yes&&no?'暂不能判断':yes?'倾向：是':'倾向：否',source:'experimental-battle-model',status:yes&&no?'unknown':yes?'likely-yes':'likely-no',modelConflict:false,observations:observations.length,basis,usedObservations,appearanceHypotheses,appearanceCondition,compatibleScenarios:compatibleScenarios(rows,stat,state.targetAppearance),detail:`仅使用${stat==='hp'?'状态扣血与已启用候选对照的恶念交换':stat==='atk'?'物理受击':'魔法受击'}记录判断本项。`+(yes&&no?'提升与不提升均能解释记录。':'仅为未校准模型下的倾向，不能作为确定结论。')+(appearanceCondition?appearanceCondition+'。':'')};
  });
  checks.push(...expressionChecks);
- return {goal:'pvp-boost-checks',inferenceScope:INFERENCE_SCOPE,focusStats:[...focus,...expressionChecks.map(c=>c.stat)],candidates,source:'expression-and-independent',expression:state.expression,checks,decision:finalDecision(checks),modelVersion:COMBAT_MODEL_VERSION,inferenceVersion:INFERENCE_VERSION,statusRulesVersion:STATUS_RULES_VERSION,battleModelVerified:false,jointConflict,jointNatures:joint?.rows.map(r=>r.nature.name)||[],statusEffects,attackObservations:active.filter(o=>o.kind==='incoming').length,statusObservations:active.filter(o=>o.kind==='percentage').length,activeObservations:active.length,totalObservations:state.observations.length};
+ return {goal:'pvp-boost-checks',inferenceScope:INFERENCE_SCOPE,focusStats:[...focus,...expressionChecks.map(c=>c.stat)],candidates,source:'expression-and-independent',expression:state.expression,checks,decision:finalDecision(checks),modelVersion:COMBAT_MODEL_VERSION,inferenceVersion:INFERENCE_VERSION,statusRulesVersion:STATUS_RULES_VERSION,battleModelVerified:false,jointConflict,jointNatures:joint?.rows.map(r=>r.nature.name)||[],statusEffects,attackObservations:active.filter(o=>o.kind==='incoming').length,statusObservations:active.filter(o=>['percentage','hp-exchange'].includes(o.kind)).length,exchangeObservations:active.filter(o=>o.kind==='hp-exchange').length,activeObservations:active.length,totalObservations:state.observations.length};
 }
 function finalDecision(checks){
  const expressionChecks=checks.filter(c=>c.expressionOnly&&c.source==='expression');
@@ -1463,7 +1575,7 @@ function renderCompatibleScenarios(check){
 }
 function renderResults(){
  const estimate=boostEstimate();
- const evidence=estimate.activeObservations?(state.result?`三项独立判定：${estimate.attackObservations}条受击＋${estimate.statusObservations}条状态${estimate.statusEffects.length?'（'+estimate.statusEffects.join('、')+'）':''}。`+(estimate.jointConflict?'联合核对存在冲突，各项保留独立结果。':'联合核对通过。'):'记录已添加，点击“判断加成”开始分项反推。'):'';
+ const evidence=estimate.activeObservations?(state.result?`三项独立判定：${estimate.attackObservations}条受击＋${estimate.statusObservations}条生命观测${estimate.statusEffects.length?'（'+estimate.statusEffects.join('、')+'）':''}。`+(estimate.jointConflict?'联合核对存在冲突，各项保留独立结果。':'联合核对通过。'):'记录已添加，点击“判断加成”开始分项反推。'):'';
  return `<div class="result-header"><h2>加成判断 ${help('boost')}</h2><span class="tiny-tag">试算</span></div>
  <div class="result-body boost-result-body">
   ${renderRecoveryResults()}
@@ -1606,9 +1718,9 @@ function resultRecord(){
  if(!validLevel(state.targetLevel)&&!expressionOnly)return null;
  const previousResult=state.result;state.result=expressionOnly?null:targetSolve();const result=state.result,estimate=boostEstimate(),now=new Date(),old=records.find(r=>r.id===state.recordId);state.result=previousResult;
  return {format:'roco-research-record',version:RESEARCH_RECORD_VERSION,id:state.recordId||uuid(),createdAt:old?.createdAt||now.toISOString(),updatedAt:now.toISOString(),date:now.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'}),title:state.recordMeta.title||defaultRecordName(now),notes:state.recordMeta.notes||'',subgroup:state.recordMeta.subgroup||'unknown',capture:structuredClone(state.recordMeta.capture||emptyCapture()),
- inferenceScope:INFERENCE_SCOPE,modelVersion:COMBAT_MODEL_VERSION,modelDefinition:{attack:'round((2*A0+22)*M)',reference:'同等级、0星、零天分且保留性格的参考攻击',attackAppearance:{normal:1,shiny:1.2},hpAppearance:{normal:1,shiny:1.5},rounding:'仅最终伤害向下取整，计算威力不提前取整',awakening:'中性不变；非中性clamp((1+.45*n攻)/(1+.45*n防),.6,1.8)，n=clamp(星级-5,0,5)',status:'用户采纳的待继续拟合候选'},
+ inferenceScope:INFERENCE_SCOPE,modelVersion:COMBAT_MODEL_VERSION,modelDefinition:{attack:'round((2*A0+22)*M)',reference:'同等级、0星、零天分且保留性格的参考攻击',attackAppearance:{normal:1,shiny:1.2},hpAppearance:{normal:1,shiny:1.5},bodyHpComparison:{version:BODY_HP_COMPARISON_MODEL,offsets:[21,22],verified:false},rounding:'仅最终伤害向下取整，计算威力不提前取整',awakening:'中性不变；非中性clamp((1+.45*n攻)/(1+.45*n防),.6,1.8)，n=clamp(星级-5,0,5)',status:'用户采纳的待继续拟合候选'},
  targetSnapshot:speciesSnapshot(pet(state.targetId)),adoptedAssumptions:Object.entries(state.dice).filter(([side,d])=>d.catalogId==='user-dual-40').map(([side,d])=>({id:'starworm-dual-40',side,description:'换算后物攻、魔攻均+40%',source:'user-adopted-condition',historicalObservationVerified:false})),
- observationSemantics:'exact-damage-v1',inferenceVersion:INFERENCE_VERSION,statusRulesVersion:STATUS_RULES_VERSION,inferenceGoal:'pvp-boost-checks',judgementMode:expressionOnly?'expression-only':'battle',boostEstimate:structuredClone(estimate),powerSemantics:'skill-base-v1',targetLevel:validLevel(state.targetLevel)?state.targetLevel:undefined,targetStars:0,targetFormula:state.targetFormula,targetAppearance:state.targetAppearance,groups:structuredClone(state.groups),profileId:state.profileId,dice:structuredClone(state.dice),phase:state.phase,hpAppearance:state.hpAppearance,hpMultiplier:state.hpMultiplier,hpByPhase:structuredClone(state.hpByPhase),diceFaces:[...state.diceFaces],shieldMapping:state.shieldMapping,targetId:state.targetId,targetName:pet(state.targetId).name,expression:state.expression,model:'unknown',template:targetLabel(),observations:structuredClone(state.observations),checks:structuredClone(estimate.checks),
+ observationSemantics:'exact-damage-v1',inferenceVersion:INFERENCE_VERSION,statusRulesVersion:STATUS_RULES_VERSION,inferenceGoal:'pvp-boost-checks',judgementMode:expressionOnly?'expression-only':'battle',boostEstimate:structuredClone(estimate),powerSemantics:'skill-base-v1',targetLevel:validLevel(state.targetLevel)?state.targetLevel:undefined,targetStars:0,targetFormula:state.targetFormula,targetAppearance:state.targetAppearance,groups:structuredClone(state.groups),profileId:state.profileId,dice:structuredClone(state.dice),phase:state.phase,observationTab:state.observationTab,hpAppearance:state.hpAppearance,hpMultiplier:state.hpMultiplier,hpByPhase:structuredClone(state.hpByPhase),diceFaces:[...state.diceFaces],shieldMapping:state.shieldMapping,targetId:state.targetId,targetName:pet(state.targetId).name,expression:state.expression,model:'unknown',template:targetLabel(),observations:structuredClone(state.observations),checks:structuredClone(estimate.checks),
  resultSnapshot:expressionOnly?{modelVersion:COMBAT_MODEL_VERSION,source:'expression',natures:natureSet(NATURES,state.expression).map(n=>n.name),count:natureSet(NATURES,state.expression).length,activeObservations:0,rows:[]}:{modelVersion:COMBAT_MODEL_VERSION,natures:result.rows.map(r=>r.nature.name),count:result.count,activeObservations:result.observations,rows:structuredClone(result.rows)},resultHistory:old?.resultHistory||[]};
 }
 function encounterFingerprint(){return JSON.stringify([state.targetId,state.targetLevel,state.targetAppearance,state.expression,state.observations,state.dice,state.groups,state.profileId,state.phase,state.recordMeta]);}
@@ -1655,7 +1767,7 @@ function viewRecord(id){
 }
 function validateLoadedObservations(){
  for(const o of state.observations){
-  if(o.kind==='recovery'){if(!validResearchRecord({format:'roco-research-record',version:RESEARCH_RECORD_VERSION,targetId:state.targetId,observations:[o]})){o.included=false;o.disabledReason='回复条件不完整，请重新录入';}continue;}
+  if(['recovery','hp-exchange'].includes(o.kind)){if(!validResearchRecord({format:'roco-research-record',version:RESEARCH_RECORD_VERSION,targetId:state.targetId,observations:[o]})){o.included=false;o.disabledReason='回复条件不完整，请重新录入';}continue;}
   const effect=EFFECTS[o.effect];
   // 旧记录按原条件继续计算；旧冻结的最大量、剩余量与下限口径不擅自改为满血。
   if(o.kind==='percentage'&&[LEGACY_STATUS_RULES_VERSION,PREVIOUS_STATUS_RULES_VERSION].includes(o.statusRulesVersion)&&effect&&o.amountMode==='raw'&&o.min===o.max&&o.percent===effect.percent&&['field','ordinary','archive'].includes(o.hpModel)&&(o.effect!=='freeze'||o.layers===20)){
@@ -1677,7 +1789,7 @@ function restoreRecord(r){
  if(!r||!pet(r.targetId))return;
  resetEncounter();state.recordId=r.id;state.recordMeta={title:r.title,notes:r.notes,subgroup:r.subgroup,capture:structuredClone(r.capture||emptyCapture())};
  state.targetId=r.targetId;state.targetLevel=validLevel(r.targetLevel)?r.targetLevel:null;state.targetAppearance=r.targetAppearance||'unknown';state.targetStars=0;state.targetFormula='growth';state.expression=r.expression||'unknown';state.observations=structuredClone(r.observations||[]);
- state.groups=structuredClone(r.groups||[]);state.dice=Object.fromEntries(['mine','enemy'].map(side=>[side,{...emptyDice(),...(r.dice?.[side]||{})}]));state.phase=r.phase||'shield';state.hpByPhase=structuredClone(r.hpByPhase||{});state.hpAppearance=r.hpAppearance||state.targetAppearance;state.hpMultiplier=r.hpMultiplier??(state.hpAppearance==='shiny'?'1.5':state.hpAppearance==='normal'?'1':'');state.diceFaces=r.diceFaces||['unknown','unknown','unknown','unknown'];state.shieldMapping=!!r.shieldMapping;
+ state.groups=structuredClone(r.groups||[]);state.dice=Object.fromEntries(['mine','enemy'].map(side=>[side,{...emptyDice(),...(r.dice?.[side]||{})}]));state.phase=r.phase||'shield';state.observationTab=r.observationTab||(state.phase==='body'?'recovery':'incoming');state.hpByPhase=structuredClone(r.hpByPhase||{});state.hpAppearance=r.hpAppearance||state.targetAppearance;state.hpMultiplier=r.hpMultiplier??(state.hpAppearance==='shiny'?'1.5':state.hpAppearance==='normal'?'1':'');state.diceFaces=r.diceFaces||['unknown','unknown','unknown','unknown'];state.shieldMapping=!!r.shieldMapping;
  for(const g of state.groups)if(g.profile&&!pool.some(p=>p.id===g.profileId)&&validProfile(g.profile))pool.push(cleanProfile(g.profile));
  syncTargetHpAppearance();validateLoadedObservations();updateObservationAppearance(state.targetAppearance);
  persistPool();state.profileId=r.profileId||state.groups[0]?.profileId||state.profileId;state.page='infer';state.inferTab='battle';state.savedFingerprint=encounterFingerprint();if($('#modal').open)$('#modal').close();render();toast('已恢复条件；点击判断可用当前模型继续试算');
@@ -1738,7 +1850,7 @@ document.addEventListener('click',e=>{
   else if(action==='sample-profile'){
     const q=PETS.find(p=>p.name==='暮星辰'),p={id:crypto.randomUUID?.()||String(Date.now()),nickname:'截图示例 · 暮星辰',petId:q.id,nature:'胆小',level:60,stars:0,ivs:{hp:10,atk:0,spa:10,def:0,spd:0,spe:10},actual:{hp:359,atk:94,spa:210,def:148,spd:176,spe:267},panelMode:'actual',skills:q.skills.filter(k=>SKILLS[k].power>0).slice(0,4)};pool.push(p);state.profileId=p.id;persistPool();render();toast('已载入截图数值示例；星级未在截图显示，请自行补录');
   }
-  else if(action==='obs-tab'){state.observationTab=state.phase==='body'?'recovery':['incoming','percentage'].includes(id)?id:'incoming';render();}
+  else if(action==='obs-tab'){state.observationTab=state.phase==='body'?(['recovery','hp-exchange'].includes(id)?id:'recovery'):['incoming','percentage'].includes(id)?id:'incoming';render();}
   else if(action==='edit-obs')openObservationEditor(Number(id));
   else if(action==='remove-obs'){state.observations.splice(Number(id),1);state.result=null;render();}
   else if(action==='clear-obs'){state.observations=[];state.result=null;render();}
@@ -1804,7 +1916,12 @@ document.addEventListener('change',e=>{
   if(e.target.id==='library-type'){state.libraryType=e.target.value;state.libraryPage=0;render();}
 
 });
-document.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.isComposing&&e.target.matches('input[type="search"][data-edit-skill-filter]'))e.preventDefault();});
+// 数字只通过输入或粘贴修改，禁止滚轮和方向键触发浏览器步进。
+document.addEventListener('wheel',e=>{if(e.target.matches('input[type="number"]'))e.preventDefault();},{passive:false});
+document.addEventListener('keydown',e=>{
+ if(e.target.matches('input[type="number"]')&&['ArrowUp','ArrowDown','PageUp','PageDown'].includes(e.key))e.preventDefault();
+ if(e.key==='Enter'&&!e.isComposing&&e.target.matches('input[type="search"][data-edit-skill-filter]'))e.preventDefault();
+});
 document.addEventListener('input',e=>{
   if(e.target.dataset.editSkillFilter){filterObservationEditorSkills(e.target.dataset.editSkillFilter);return;}
   if(e.target.id==='obs-remaining-percent')updatePercentageEffect();
@@ -1846,10 +1963,15 @@ document.addEventListener('submit',e=>{
     const i=pool.findIndex(x=>x.id===p.id);if(i>=0)pool[i]=cleanProfile(p);else pool.push(cleanProfile(p));state.profileId=p.id;state.result=null;persistPool();$('#modal').close();render();toast('精灵档案已保存');
   }
   if(e.target.id==='observation-form'){
-    e.preventDefault();if(!requireTargetLevel())return;const d=new FormData(e.target),kind=state.phase==='body'?'recovery':state.observationTab;let o={kind};
+    e.preventDefault();if(!requireTargetLevel())return;const d=new FormData(e.target),kind=state.observationTab;let o={kind};
     const amount=d.get('damage');o.damage=Number(amount);o.min=o.max=o.damage;
     if(amount===null||String(amount).trim()===''||!Number.isInteger(o.damage)||o.damage<0){toast('请填写完整整数飘字');return;}
-    if(kind==='recovery'){
+    if(kind==='hp-exchange'){
+      const skill=Object.values(SKILLS).find(s=>s.name==='恶念交换');
+      Object.assign(o,exchangeValues(Object.fromEntries(d)),{stat:'hp',phase:'body',skill:skill?.id||null,skillName:'恶念交换',exchangeRulesVersion:HP_EXCHANGE_RULES_VERSION,combatModel:COMBAT_MODEL_VERSION,dice:structuredClone(state.dice),diceHpMultiplier:state.dice.enemy.hpMultiplier,conditionsConfirmed:!!d.get('confirmed'),appearance:state.targetAppearance});o.min=o.max=o.damage;
+      if(!hpExchangeRanges(o).length||!validResearchRecord({format:'roco-research-record',version:RESEARCH_RECORD_VERSION,targetId:state.targetId,observations:[o]})){toast('请填写有效的回血与前后百分比：交换后血量须高于交换前；勾选确认条件。');return;}
+      o.label=exchangeLabel(o);
+    }else if(kind==='recovery'){
       const skill=SKILLS[d.get('recoverySkill')],percent=Number(d.get('healPercent')),response=d.get('healResponse'),rule=recoverySkillRule(skill);
       const healPercents=rule&&response==='unknown'?[rule.normal,...(rule.response?[rule.response]:[])]:[percent];
       if(!d.get('confirmed')||!recoveryHpRanges({damage:o.damage,healPercents,rounding:d.get('rounding')}).length){toast('请填写大于0的完整回血飘字与有效比例，并确认未回满截断、相关加成已核对');return;}
